@@ -47,9 +47,10 @@ def fetchNetflixTopTenByCountry(country='', type_='', week=''):
 # parameter : soup
 # return : [(rank, name, weeks on Top 10)]
 def getDetails(soup):
-    rankList = list(map(lambda td: td.contents[0], soup.find_all('td', class_='tbl-cell-rank')))
-    nameList = list(map(lambda td: td.contents[0], soup.find_all('td', class_='tbl-cell-name')))
-    weekOnTopList = list(map(lambda td: td.contents[0], soup.find_all('span', class_='wk-number')))
+    tableSoup = soup.find('tbody', class_='css-1rheyty ehtxqvx0')
+    rankList = list(map(lambda td: td.span.string, tableSoup.find_all('td', class_='title')))
+    nameList = list(map(lambda td: td.button.string, tableSoup.find_all('td', class_='title')))
+    weekOnTopList = list(map(lambda tbody: tbody.find_all('td')[1].string, tableSoup))
     zipList = zip(rankList, nameList, weekOnTopList)
     return list(zipList)
 
