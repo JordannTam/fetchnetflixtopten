@@ -125,9 +125,32 @@ def fetch_specific_week(
     return _parse_countries_tsv(response.text, target_week=week)
 
 
+def fetch_recent_weeks(
+    session: requests.Session,
+    config: NetflixConfig,
+    weeks_count: int,
+) -> tuple[CountryRanking, ...]:
+    """Download TSV and parse rankings for the N most recent weeks."""
+    if weeks_count <= 0:
+        return ()
+
+    logger.info("Fetching countries TSV for %d recent weeks", weeks_count)
+    response = session.get(
+        COUNTRIES_TSV_URL,
+        timeout=config.request_timeout,
+    )
+    response.raise_for_status()
+
+    all_rankings = _parse_countries_tsv(response.text, include_all_weeks=True)
+    weeks = sorted({ranking.week for ranking in all_rankings}, reverse=True)
+    selected = set(weeks[:weeks_count])
+    return tuple(ranking for ranking in all_rankings if ranking.week in selected)
+
+
 def _parse_countries_tsv(
     tsv_text: str,
     target_week: str | None = None,
+    include_all_weeks: bool = False,
 ) -> tuple[CountryRanking, ...]:
     """Parse the TSV text into CountryRanking objects.
 
@@ -169,7 +192,7 @@ def _parse_countries_tsv(
             continue
         grouped[(week, country_name, row["category"])].append(row)
 
-    if target_week is None:
+    if target_week is None and not include_all_weeks:
         grouped = {
             key: rows
             for key, rows in grouped.items()

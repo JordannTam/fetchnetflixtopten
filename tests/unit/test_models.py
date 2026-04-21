@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from src.models import CountryRanking, RankingEntry, ScrapeResult, ScrapeRun
+from src.models import ContentRef, CountryRanking, RankingEntry, ScrapeResult, ScrapeRun
 
 
 class TestRankingEntry:
@@ -33,6 +33,20 @@ class TestRankingEntry:
             assert False, "Should have raised FrozenInstanceError"
         except AttributeError:
             pass
+
+    def test_to_document_with_content_ref_and_links(self):
+        entry = RankingEntry(
+            rank=1,
+            title="Linked Title",
+            weeks_in_top_10=4,
+            content_ref=ContentRef(provider="tmdb", provider_content_id="123"),
+            match_status="matched",
+            linked_artist_ids=("1297",),
+        )
+        doc = entry.to_document()
+        assert doc["content_ref"]["provider"] == "tmdb"
+        assert doc["match_status"] == "matched"
+        assert doc["linked_artist_ids"] == ["1297"]
 
 
 class TestCountryRanking:

@@ -10,6 +10,7 @@ from src.fetchers.tsv_fetcher import (
     _parse_countries_tsv,
     _parse_int,
     fetch_latest_week,
+    fetch_recent_weeks,
 )
 
 FIXTURES_DIR = os.path.join(
@@ -115,3 +116,17 @@ class TestFetchLatestWeek:
             assert False, "Should have raised"
         except Exception:
             pass
+
+    @responses.activate
+    def test_fetch_recent_weeks(self):
+        tsv_text = _read_fixture("sample_countries.tsv")
+        responses.add(
+            responses.GET,
+            COUNTRIES_TSV_URL,
+            body=tsv_text,
+            status=200,
+        )
+        config = NetflixConfig()
+        session = create_session(config)
+        rankings = fetch_recent_weeks(session, config, weeks_count=1)
+        assert len(rankings) == 4

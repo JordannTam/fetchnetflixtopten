@@ -40,15 +40,34 @@ class NetflixConfig:
     request_timeout: int = 30
     retry_count: int = 3
     html_delay: float = 1.5
+    tmdb_base_url: str = "https://api.themoviedb.org/3"
+    tmdb_api_key: str = ""
+    tmdb_timeout: int = 15
+    fuzzy_review_threshold: float = 0.85
+    weeks_top10_cap: int = 10  # cap longevity bonus at this many weeks (10 weeks = 100 pts max)
 
 
 @dataclass(frozen=True)
 class MongoConfig:
     uri: str = ""
     database: str = "netflix_top10"
-    rankings_collection: str = "weekly_rankings"
-    runs_collection: str = "scrape_runs"
+    rankings_collection: str = "netflix_top10_weekly_rankings"
+    runs_collection: str = "netflix_top10_scrape_runs"
+    general_database: str = "general"
+    artists_collection: str = "artists"
+    content_catalog_collection: str = "netflix_top10_content_catalog"
+    content_links_collection: str = "netflix_top10_content_artist_links"
+    artist_drama_score_collection: str = "netflix_top10_artist_drama_score"
+    review_queue_collection: str = "netflix_top10_match_review_queue"
+    linking_test_mode: bool = False
+    artists_source_database: str = "general"
+    artists_source_uri: str = ""
     max_pool_size: int = 1
+
+
+def _parse_bool(value: str | None) -> bool:
+    normalized = (value or "").strip().lower()
+    return normalized in {"1", "true", "yes", "on"}
 
 
 def load_config() -> tuple[NetflixConfig, MongoConfig]:
@@ -76,6 +95,16 @@ def load_config() -> tuple[NetflixConfig, MongoConfig]:
         )
 
     return (
-        NetflixConfig(),
-        MongoConfig(uri=mongo_uri),
+        NetflixConfig(
+            tmdb_api_key=os.environ.get("TMDB_API_KEY", "").strip(),
+        ),
+        MongoConfig(
+            uri=mongo_uri,
+            linking_test_mode=_parse_bool(os.environ.get("LINKING_TEST_MODE")),
+            artists_source_database=(
+                os.environ.get("ARTISTS_SOURCE_DATABASE", "general").strip()
+                or "general"
+            ),
+            artists_source_uri=os.environ.get("ARTISTS_MONGODB_URI", "").strip(),
+        ),
     )

@@ -22,6 +22,7 @@ from src.config import MongoConfig
 logger = logging.getLogger(__name__)
 
 _client: MongoClient | None = None
+_external_clients: dict[str, MongoClient] = {}
 
 
 def get_database(config: MongoConfig) -> Database:
@@ -48,6 +49,24 @@ def get_database(config: MongoConfig) -> Database:
     return _client[config.database]
 
 
+def get_external_database(
+    uri: str,
+    database: str,
+    max_pool_size: int = 1,
+) -> Database:
+    """Get a database handle for a secondary MongoDB URI."""
+    client = _external_clients.get(uri)
+    if client is None:
+        logger.info("Creating external MongoDB connection")
+        client = MongoClient(
+            uri,
+            maxPoolSize=max_pool_size,
+            serverSelectionTimeoutMS=5000,
+        )
+        _external_clients[uri] = client
+    return client[database]
+
+
 def close_connection() -> None:
     """Close the MongoDB connection and reset the singleton.
 
@@ -59,3 +78,6 @@ def close_connection() -> None:
         _client.close()
         _client = None
         logger.info("MongoDB connection closed")
+    for client in _external_clients.values():
+        client.close()
+    _external_clients.clear()

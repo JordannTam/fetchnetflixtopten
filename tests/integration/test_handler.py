@@ -84,3 +84,64 @@ class TestLambdaHandler:
         body = json.loads(result["body"])
 
         assert body["source_used"] in ("html_fallback", "none")
+
+    @responses.activate
+    @patch("src.handler.get_database")
+    @patch.dict(
+        os.environ,
+        {"MONGODB_URI": "mongodb://localhost:27017/test"},
+    )
+    def test_target_week_event(self, mock_get_db):
+        tsv_text = _read_fixture("sample_countries.tsv")
+        responses.add(
+            responses.GET,
+            COUNTRIES_TSV_URL,
+            body=tsv_text,
+            status=200,
+        )
+
+        mock_db = MagicMock()
+        mock_get_db.return_value = mock_db
+        mock_result = MagicMock()
+        mock_result.upserted_count = 4
+        mock_result.modified_count = 0
+        mock_db.__getitem__.return_value.bulk_write.return_value = mock_result
+
+        from src.handler import lambda_handler
+
+        result = lambda_handler({"target_week": "2026-02-01"}, None)
+        body = json.loads(result["body"])
+        assert result["statusCode"] == 200
+        assert body["source_used"] == "tsv"
+        assert body["saved"] == 4
+        assert "metrics" in body
+
+    @responses.activate
+    @patch("src.handler.get_database")
+    @patch.dict(
+        os.environ,
+        {"MONGODB_URI": "mongodb://localhost:27017/test"},
+    )
+    def test_backfill_weeks_event(self, mock_get_db):
+        tsv_text = _read_fixture("sample_countries.tsv")
+        responses.add(
+            responses.GET,
+            COUNTRIES_TSV_URL,
+            body=tsv_text,
+            status=200,
+        )
+
+        mock_db = MagicMock()
+        mock_get_db.return_value = mock_db
+        mock_result = MagicMock()
+        mock_result.upserted_count = 4
+        mock_result.modified_count = 0
+        mock_db.__getitem__.return_value.bulk_write.return_value = mock_result
+
+        from src.handler import lambda_handler
+
+        result = lambda_handler({"backfill_weeks": 1}, None)
+        body = json.loads(result["body"])
+        assert result["statusCode"] == 200
+        assert body["saved"] == 4
+        assert "metrics" in body

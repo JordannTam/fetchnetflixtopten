@@ -27,7 +27,9 @@ from requests.exceptions import RequestException
 from src.config import MongoConfig, NetflixConfig, load_config
 from src.fetchers import fetch_rankings
 from src.fetchers.http_client import create_session
-from src.models import ScrapeRun
+from src.fetchers.tsv_fetcher import fetch_recent_weeks, fetch_specific_week
+from src.linking import link_rankings_to_artists
+from src.models import ScrapeResult, ScrapeRun
 from src.storage.mongo_client import get_database
 from src.storage.repository import RankingsRepository
 from src.validation.validators import validate_all
@@ -71,6 +73,13 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     run_id = str(uuid.uuid4())
     started_at = datetime.now(timezone.utc)
     errors: list[str] = []
+    linking_metrics = {
+        "content_resolved": 0,
+        "artists_linked": 0,
+        "ambiguous_matches": 0,
+        "unmatched_entries": 0,
+        "drama_scores_upserted": 0,
+    }
 
     logger.info("Starting scrape run %s", run_id)
 
@@ -86,12 +95,34 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     session = create_session(netflix_config)
 
     try:
-        result = fetch_rankings(session, netflix_config)
+        requested_week = str(event.get("target_week", "")).strip()
+        recent_weeks = int(event.get("backfill_weeks", 0) or 0)
+        if requested_week:
+            rankings = fetch_specific_week(session, netflix_config, requested_week)
+            result_source = "tsv"
+            result_errors: tuple[str, ...] = ()
+
+            result = ScrapeResult(
+                rankings=rankings,
+                source_used=result_source,
+                errors=result_errors,
+            )
+        elif recent_weeks > 0:
+            rankings = fetch_recent_weeks(session, netflix_config, recent_weeks)
+
+            result = ScrapeResult(
+                rankings=rankings,
+                source_used="tsv",
+                errors=(),
+            )
+        else:
+            result = fetch_rankings(session, netflix_config)
     except (RequestException, ValueError, TimeoutError) as exc:
         logger.error("Fetch failed: %s", exc)
         errors.append(f"Fetch failed: {exc}")
         return _finish_run(
             run_id, started_at, "failure", "none", 0, errors,
+            linking_metrics,
             mongo_config,
         )
 
@@ -99,6 +130,7 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         errors.extend(result.errors)
         return _finish_run(
             run_id, started_at, "failure", result.source_used, 0, errors,
+            linking_metrics,
             mongo_config,
         )
 
@@ -118,18 +150,64 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         db = get_database(mongo_config)
         repo = RankingsRepository(db, mongo_config)
         repo.ensure_indexes()
-        saved = repo.save_rankings(result.rankings)
-    except PyMongoError as exc:
+        linking_result = link_rankings_to_artists(
+            result.rankings,
+            session,
+            netflix_config,
+            repo,
+        )
+        try:
+            with db.client.start_session() as mongo_session:
+                with mongo_session.start_transaction():
+                    saved = repo.save_rankings(
+                        linking_result.rankings,
+                        mongo_session=mongo_session,
+                    )
+                    repo.save_content_catalog(
+                        linking_result.content_docs,
+                        mongo_session=mongo_session,
+                    )
+                    repo.save_content_artist_links(
+                        linking_result.link_docs,
+                        mongo_session=mongo_session,
+                    )
+                    drama_scores_saved = repo.save_artist_drama_scores(
+                        linking_result.drama_score_docs,
+                        mongo_session=mongo_session,
+                    )
+                    repo.save_match_reviews(
+                        linking_result.review_docs,
+                        mongo_session=mongo_session,
+                    )
+        except PyMongoError as exc:
+            if "Transaction numbers are only allowed on a replica set" not in str(exc):
+                raise
+            logger.warning("Standalone MongoDB detected — retrying without transaction")
+            saved = repo.save_rankings(linking_result.rankings)
+            repo.save_content_catalog(linking_result.content_docs)
+            repo.save_content_artist_links(linking_result.link_docs)
+            drama_scores_saved = repo.save_artist_drama_scores(linking_result.drama_score_docs)
+            repo.save_match_reviews(linking_result.review_docs)
+        linking_metrics = {
+            "content_resolved": linking_result.metrics.content_resolved,
+            "artists_linked": linking_result.metrics.artists_linked,
+            "ambiguous_matches": linking_result.metrics.ambiguous_matches,
+            "unmatched_entries": linking_result.metrics.unmatched_entries,
+            "drama_scores_upserted": drama_scores_saved,
+        }
+    except (PyMongoError, RequestException, ValueError, TypeError, KeyError) as exc:
         logger.error("Storage failed: %s", exc)
         errors.append(f"Storage failed: {exc}")
         return _finish_run(
             run_id, started_at, "failure", result.source_used, 0, errors,
+            linking_metrics,
             mongo_config,
         )
 
     status = "partial_failure" if errors else "success"
     return _finish_run(
         run_id, started_at, status, result.source_used, saved, errors,
+        linking_metrics,
         mongo_config,
     )
 
@@ -141,6 +219,7 @@ def _finish_run(
     source_used: str,
     saved: int,
     errors: list[str],
+    linking_metrics: dict[str, int],
     mongo_config: MongoConfig,
 ) -> dict[str, Any]:
     """Record the scrape run to MongoDB and return the Lambda response.
@@ -172,6 +251,11 @@ def _finish_run(
         source_used=source_used,
         total_documents_saved=saved,
         errors=tuple(errors),
+        content_resolved=linking_metrics["content_resolved"],
+        artists_linked=linking_metrics["artists_linked"],
+        ambiguous_matches=linking_metrics["ambiguous_matches"],
+        unmatched_entries=linking_metrics["unmatched_entries"],
+        drama_scores_upserted=linking_metrics["drama_scores_upserted"],
     )
 
     try:
@@ -193,6 +277,7 @@ def _finish_run(
             "status": status,
             "source_used": source_used,
             "saved": saved,
+            "metrics": linking_metrics,
             "errors": list(errors),
         }),
     }

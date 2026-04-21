@@ -12,6 +12,20 @@ from datetime import datetime, timezone
 
 
 @dataclass(frozen=True)
+class ContentRef:
+    """Canonical content identifier from an external provider."""
+
+    provider: str
+    provider_content_id: str
+
+    def to_document(self) -> dict:
+        return {
+            "provider": self.provider,
+            "provider_content_id": self.provider_content_id,
+        }
+
+
+@dataclass(frozen=True)
 class RankingEntry:
     """A single show/film in a Top 10 list.
 
@@ -26,6 +40,9 @@ class RankingEntry:
     title: str
     weeks_in_top_10: int
     hours_viewed: int = 0
+    content_ref: ContentRef | None = None
+    match_status: str = "unmatched"
+    linked_artist_ids: tuple[str, ...] = ()
 
     def to_document(self) -> dict:
         """Convert to a MongoDB-ready dict. Omits hours_viewed if zero."""
@@ -36,6 +53,12 @@ class RankingEntry:
         }
         if self.hours_viewed > 0:
             doc["hours_viewed"] = self.hours_viewed
+        if self.content_ref is not None:
+            doc["content_ref"] = self.content_ref.to_document()
+        if self.match_status != "unmatched":
+            doc["match_status"] = self.match_status
+        if self.linked_artist_ids:
+            doc["linked_artist_ids"] = list(self.linked_artist_ids)
         return doc
 
 
@@ -115,6 +138,11 @@ class ScrapeRun:
     source_used: str
     total_documents_saved: int
     errors: tuple[str, ...] = ()
+    content_resolved: int = 0
+    artists_linked: int = 0
+    ambiguous_matches: int = 0
+    unmatched_entries: int = 0
+    drama_scores_upserted: int = 0
 
     def to_document(self) -> dict:
         """Convert to a MongoDB-ready dict for the scrape_runs collection."""
@@ -126,4 +154,9 @@ class ScrapeRun:
             "source_used": self.source_used,
             "total_documents_saved": self.total_documents_saved,
             "errors": list(self.errors),
+            "content_resolved": self.content_resolved,
+            "artists_linked": self.artists_linked,
+            "ambiguous_matches": self.ambiguous_matches,
+            "unmatched_entries": self.unmatched_entries,
+            "drama_scores_upserted": self.drama_scores_upserted,
         }
