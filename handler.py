@@ -130,17 +130,60 @@ def load_artist_index(uri: str, db_name: str) -> dict[int, dict]:
         client.close()
 
 
-def score_matches(matches: list[dict]) -> list[dict]:
-    """Per-artist: max DP per (artist, title) across countries, then sum across titles.
+def _drama_record(m: dict, dp: float) -> dict:
+    return {
+        "tmdb_id": m["tmdb_id"],
+        "title": m["title"],
+        "release_year": m.get("release_year"),
+        "country": m["country"],
+        "rank": m["rank"],
+        "contribution": dp,
+    }
 
-    Returns one doc per artist with embedded drama breakdown:
-      {
-        artist_id, tenant_id, english_name, korean_name, week,
-        dp_netflix,                       # total across distinct titles
-        dramas: [{tmdb_id, title, contribution}, ...]
-      }
+
+def _build_doc(meta: dict, country: str, dramas: list[dict]) -> dict:
+    week_date = meta["week"]
+    iso = datetime.strptime(week_date, "%Y-%m-%d").date().isocalendar()
+    dramas_sorted = sorted(dramas, key=lambda d: -d["contribution"])
+    total = sum(d["contribution"] for d in dramas_sorted)
+    return {
+        "artist_id": meta["artist_id"],
+        "tenant_id": meta.get("tenant_id"),
+        "english_name": meta.get("english_name"),
+        "korean_name": meta.get("korean_name"),
+        "year": iso.year,
+        "week": iso.week,
+        "week_date": week_date,
+        "country": country,
+        "dp_netflix": round(total, 2),
+        "dramas": [
+            {
+                "tmdb_id": d["tmdb_id"],
+                "title": d["title"],
+                "release_year": d.get("release_year"),
+                "country": d["country"],
+                "rank": d["rank"],
+                "contribution": round(d["contribution"], 2),
+            }
+            for d in dramas_sorted
+        ],
+    }
+
+
+def score_matches(matches: list[dict]) -> list[dict]:
+    """Emit one doc per (artist, country) for that week PLUS one GLOBAL doc per artist.
+
+    Per-country docs: dp_netflix uses only that country's chart rows.
+    GLOBAL docs: dp_netflix uses max-per-drama across countries
+                 (avoids cross-country inflation; matches the spec).
+
+    Frontend filtering by country: query for that country directly.
+    Frontend artist timeline (aggregate): query country == "GLOBAL".
     """
-    by_artist_title: dict[tuple[str, int], dict] = {}
+    # (artist_id, country) -> {tmdb_id: drama_record}
+    per_country: defaultdict[tuple[str, str], dict[int, dict]] = defaultdict(dict)
+    # artist_id -> {tmdb_id: drama_record}  (max across countries)
+    per_global: defaultdict[str, dict[int, dict]] = defaultdict(dict)
     artist_meta: dict[str, dict] = {}
 
     for m in matches:
@@ -149,59 +192,39 @@ def score_matches(matches: list[dict]) -> list[dict]:
         rank_score = max(201 - m["rank"], 0)
         dp = rank_score + m["weeks_in_top10"] * 10 + m["hours_viewed"] / 1_000_000
         artist_id = str(m["artist_id"])
-        key = (artist_id, m["tmdb_id"])
-        existing = by_artist_title.get(key)
-        if existing is None or dp > existing["contribution"]:
-            by_artist_title[key] = {
-                "tmdb_id": m["tmdb_id"],
-                "title": m["title"],
-                "release_year": m.get("release_year"),
-                "country": m["country"],            # country whose chart row produced the max DP
-                "rank": m["rank"],                  # rank in that country (helpful for debugging)
-                "contribution": dp,
-            }
+        country = m["country"]
+        tmdb_id = m["tmdb_id"]
         artist_meta[artist_id] = m
+        drama = _drama_record(m, dp)
 
-    artist_dramas: defaultdict[str, list[dict]] = defaultdict(list)
-    for (artist_id, _), drama in by_artist_title.items():
-        artist_dramas[artist_id].append(drama)
+        # Per-country: max in case same drama appears twice in same country (edge case)
+        existing = per_country[(artist_id, country)].get(tmdb_id)
+        if existing is None or dp > existing["contribution"]:
+            per_country[(artist_id, country)][tmdb_id] = drama
+
+        # Global: max per (artist, drama) across countries
+        existing = per_global[artist_id].get(tmdb_id)
+        if existing is None or dp > existing["contribution"]:
+            per_global[artist_id][tmdb_id] = drama
 
     out: list[dict] = []
-    for artist_id, dramas in artist_dramas.items():
-        total = sum(d["contribution"] for d in dramas)
-        meta = artist_meta[artist_id]
-        week_date = meta["week"]
-        # ISO week number: 1..52 (or 53). isocalendar().year handles edge cases
-        # where a date in early Jan or late Dec belongs to the prior/next ISO year.
-        iso = datetime.strptime(week_date, "%Y-%m-%d").date().isocalendar()
-        out.append({
-            "artist_id": meta["artist_id"],          # ObjectId
-            "tenant_id": meta.get("tenant_id"),      # ObjectId or None
-            "english_name": meta.get("english_name"),
-            "korean_name": meta.get("korean_name"),
-            "year": iso.year,
-            "week": iso.week,
-            "week_date": week_date,                  # original chart-end date (Sunday)
-            "dp_netflix": round(total, 2),
-            "dramas": [
-                {
-                    "tmdb_id": d["tmdb_id"],
-                    "title": d["title"],
-                    "release_year": d.get("release_year"),
-                    "country": d["country"],
-                    "rank": d["rank"],
-                    "contribution": round(d["contribution"], 2),
-                }
-                for d in sorted(dramas, key=lambda x: -x["contribution"])
-            ],
-        })
-    return sorted(out, key=lambda x: -x["dp_netflix"])
+    for (artist_id, country), drama_map in per_country.items():
+        out.append(_build_doc(artist_meta[artist_id], country, list(drama_map.values())))
+    for artist_id, drama_map in per_global.items():
+        out.append(_build_doc(artist_meta[artist_id], "GLOBAL", list(drama_map.values())))
+
+    return sorted(out, key=lambda x: (-x["dp_netflix"], x["country"]))
 
 
 def upsert_scores(scores: list[dict], uri: str, db_name: str) -> dict:
-    """Bulk upsert into general.artist_dp_netflix keyed by (tenant_id, artist_id, year, week).
+    """Bulk upsert into general.artist_dp_netflix.
 
-    Idempotent: re-running the same (year, week) overwrites the doc.
+    Unique key: (tenant_id, artist_id, year, week, country).
+    The 'country' field uses the literal "GLOBAL" for the cross-country aggregate row.
+
+    Also creates two non-unique indexes to support frontend queries:
+      - (year, week, country, dp_netflix desc) for "top artists in country X this week"
+      - (artist_id, country, year, week) for "artist timeline in country X"
     """
     if not scores:
         return {"upserted": 0, "modified": 0, "matched": 0}
@@ -212,9 +235,17 @@ def upsert_scores(scores: list[dict], uri: str, db_name: str) -> dict:
         coll = client[db_name][ARTIST_DP_COLLECTION]
         # Idempotent: create_index is a no-op if the index already exists.
         coll.create_index(
-            [("tenant_id", 1), ("artist_id", 1), ("year", 1), ("week", 1)],
+            [("tenant_id", 1), ("artist_id", 1), ("year", 1), ("week", 1), ("country", 1)],
             unique=True,
-            name="tenant_artist_year_week_unique",
+            name="tenant_artist_year_week_country_unique",
+        )
+        coll.create_index(
+            [("year", 1), ("week", 1), ("country", 1), ("dp_netflix", -1)],
+            name="leaderboard_by_country_week",
+        )
+        coll.create_index(
+            [("artist_id", 1), ("country", 1), ("year", 1), ("week", 1)],
+            name="artist_country_timeline",
         )
         operations = [
             UpdateOne(
@@ -223,6 +254,7 @@ def upsert_scores(scores: list[dict], uri: str, db_name: str) -> dict:
                     "artist_id": s["artist_id"],
                     "year": s["year"],
                     "week": s["week"],
+                    "country": s["country"],
                 },
                 {"$set": {**s, "updated_at": now}},
                 upsert=True,

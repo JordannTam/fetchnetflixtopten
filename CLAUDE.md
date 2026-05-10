@@ -48,25 +48,52 @@ All scripts dry-run by default. Lambda (`lambda_handler`) always commits.
 
 ## Pipeline Schema (`general.artist_dp_netflix`)
 
+Each weekly run writes **one doc per (artist, country) PLUS one GLOBAL doc per artist**.
+
 ```js
 {
   artist_id:    ObjectId("..."),    // ┐
-  tenant_id:    ObjectId("..."),    // ├─ unique key (tenant_id, artist_id, year, week)
-  year:         2026,               // │
-  week:         18,                 // ┘  ISO week number
-  week_date:    "2026-05-03",       // chart-end Sunday (kept for human readability)
+  tenant_id:    ObjectId("..."),    // │
+  year:         2026,               // ├─ unique key
+  week:         18,                 // │   (tenant_id, artist_id, year, week, country)
+  country:      "South Korea",      // ┘   or "GLOBAL" for the aggregate row
+  week_date:    "2026-05-03",       // chart-end Sunday (human-readable)
   english_name: "Go YounJung",
   korean_name:  "고윤정",
-  dp_netflix:   552.0,
+  dp_netflix:   229.0,              // per-country: only that country's chart rows
+                                    // GLOBAL: max-per-drama across countries, summed
   dramas: [
-    { tmdb_id, title, release_year, contribution },
+    { tmdb_id, title, release_year, country, rank, contribution },
     ...
   ],
   updated_at:   ISODate(...)
 }
 ```
 
-Unique compound index `tenant_artist_year_week_unique` on `(tenant_id, artist_id, year, week)` is created automatically on first write.
+Per-country rows: `dramas[]` contains only dramas that charted in *that* country for the artist; `dp_netflix` is the sum of those contributions.
+
+GLOBAL row: for each (artist, drama), take the **max contribution across countries** (avoids cross-country inflation), then sum across distinct dramas. The `country` field inside each drama entry records *where* that max came from.
+
+### Indexes (created automatically on first write)
+
+| Index | Purpose |
+|---|---|
+| `tenant_artist_year_week_country_unique` | Idempotent upsert + uniqueness |
+| `leaderboard_by_country_week` | Top-N artists in a country for a week |
+| `artist_country_timeline` | Single artist's weekly timeline in a country |
+
+### Frontend query patterns
+
+```js
+// Artist worldwide timeline
+db.artist_dp_netflix.find({artist_id: X, country: "GLOBAL"}).sort({year:1, week:1})
+
+// Artist's timeline in Korea
+db.artist_dp_netflix.find({artist_id: X, country: "South Korea"}).sort({year:1, week:1})
+
+// Top 10 in Vietnam this week
+db.artist_dp_netflix.find({country: "Vietnam", year, week}).sort({dp_netflix: -1}).limit(10)
+```
 
 ## Pipeline Strategy
 
@@ -75,8 +102,8 @@ Unique compound index `tenant_artist_year_week_unique` on `(tenant_id, artist_id
 3. **Resolve titles** via `/search/{movie|tv}` — first hit; capture `release_date` / `first_air_date` for `release_year`. Cached by `(title, category)`.
 4. **Fetch cast** via `/{media_type}/{id}/credits`. Cached by `tmdb_id`.
 5. **Match deterministically**: `dict.get(tmdb_person_id)` against the in-memory artist index. No name normalization, no fuzzy.
-6. **Score**: per `(artist, tmdb_id)` take the max DP across countries; sum across distinct titles per artist.
-7. **Upsert** into `general.artist_dp_netflix`.
+6. **Score**: build per-country rows (one per (artist, country) the artist charted in) AND a GLOBAL row (max-per-drama across countries, summed) per artist.
+7. **Upsert** into `general.artist_dp_netflix`. Typical run: ~46 GLOBAL + ~120 per-country docs/week.
 
 ## Scoring Formula (Netflix-only)
 
@@ -126,6 +153,8 @@ Finds all artists currently carrying `tmdb_person_id`, refetches the AKA from TM
 - **TMDB v3 mononym search is unreliable** — "Joy", "Wendy", "Irene" return 20 candidates ranked by global popularity. Korean-name verification is the load-bearing filter; do not weaken it without a replacement.
 - **Group artists** (Girls' Generation, Red Velvet, AOA) are stored as `type: ["Musician"]`. The Actor pre-filter excludes them automatically.
 - **TMDB `also_known_as` often includes group names**. The blocked-set filter catches groups already in the artists collection. Foreign-script transliterations of group names (e.g. `少女時代`) leak unless they're added as aliases on the group's artist doc.
-- **`week` is an ISO week number (int)**, not a date. The unique key is `(tenant_id, artist_id, year, week)` because `week` alone wraps yearly. The original chart-end Sunday is preserved as `week_date`.
+- **`week` is an ISO week number (int)**, not a date. The unique key is `(tenant_id, artist_id, year, week, country)` because `week` alone wraps yearly and there's one doc per country per artist. The original chart-end Sunday is preserved as `week_date`.
+- **`country: "GLOBAL"`** is the literal value used for the cross-country aggregate row. There's exactly one GLOBAL row per (artist, week). Don't confuse it with the per-country rows.
+- **Per-country `dp_netflix` ≠ slice of GLOBAL `dp_netflix`**. GLOBAL uses max-per-drama-across-countries; per-country uses only that country's rows. They can disagree when the same drama charts in multiple countries — that's intentional.
 - **Pipeline coverage** is bounded by alias backfill — only artists with `tmdb_person_id` can match. Re-run the backfill (with relaxed filters or manual curation) to extend coverage.
 - **No retry / no error backoff** — TMDB or Mongo failures fail the run. Acceptable for a weekly batch; revisit if Lambda failures become routine.

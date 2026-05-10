@@ -43,8 +43,9 @@ The Lambda entry (`handler.lambda_handler`) always commits — there's no dry-ru
 ## What gets written
 
 Collection: `general.artist_dp_netflix`
-Unique key: `(tenant_id, artist_id, year, week)`
-Index: `tenant_artist_year_week_unique` (created on first write)
+Unique key: `(tenant_id, artist_id, year, week, country)`
+
+Each weekly run writes **one doc per (artist, country) the artist charted in** PLUS **one GLOBAL doc per artist** (cross-country aggregate). For 46 scored artists this typically produces ~120 per-country docs + 46 GLOBAL = ~165 docs/week.
 
 ```js
 {
@@ -53,21 +54,52 @@ Index: `tenant_artist_year_week_unique` (created on first write)
   year:         2026,
   week:         18,                   // ISO week number
   week_date:    "2026-05-03",         // chart-end Sunday
+  country:      "South Korea",        // or "GLOBAL"
   english_name: "Go YounJung",
   korean_name:  "고윤정",
-  dp_netflix:   552.0,
+  dp_netflix:   229.0,                // per-country: only that country's chart rows
+                                      // GLOBAL:      max-per-drama across countries
   dramas: [
     {
       tmdb_id:      229891,
       title:        "Can This Love Be Translated?",
       release_year: 2026,
-      contribution: 323.0
+      country:      "South Korea",
+      rank:         2,
+      contribution: 229.0
     },
     ...
   ],
   updated_at:   ISODate(...)
 }
 ```
+
+Indexes created automatically on first write:
+
+| Index | For |
+|---|---|
+| `tenant_artist_year_week_country_unique` | Idempotent upsert + uniqueness |
+| `leaderboard_by_country_week` | Top-N artists in country X for week Y |
+| `artist_country_timeline` | Single artist's weekly timeline in country X |
+
+## Frontend query patterns
+
+```js
+// Artist worldwide timeline (chart over weeks)
+db.artist_dp_netflix.find({artist_id: X, country: "GLOBAL"}).sort({year:1, week:1})
+
+// Artist's timeline in a specific country
+db.artist_dp_netflix.find({artist_id: X, country: "South Korea"}).sort({year:1, week:1})
+
+// Top 10 artists in Vietnam this week
+db.artist_dp_netflix.find({country: "Vietnam", year: 2026, week: 18})
+  .sort({dp_netflix: -1}).limit(10)
+
+// Country comparison for one artist this week
+db.artist_dp_netflix.find({artist_id: X, year: 2026, week: 18})
+```
+
+GLOBAL vs per-country totals can disagree — that's intentional. GLOBAL takes the max contribution per drama across countries (so a single drama in 5 countries isn't double-counted); per-country only considers that country's chart rows. A drama appearing only in Vietnam adds to Vietnam's total and to GLOBAL, but not to Korea's total.
 
 ## Scoring formula
 
@@ -139,6 +171,7 @@ python3 scripts/rollback_aliases_backfill.py --apply
 | Titles resolved on TMDB | 158 (95%) |
 | Cast → artist matches | 125 |
 | Artists scored | 46 |
+| Docs written (per-country + GLOBAL) | ~165 |
 | Pipeline runtime | ~70 seconds |
 
 ## Files
