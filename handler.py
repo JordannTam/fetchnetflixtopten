@@ -49,14 +49,16 @@ def fetch_tsv() -> list[dict]:
     return list(csv.DictReader(io.StringIO(r.text), delimiter="\t"))
 
 
-def filter_rows(rows: list[dict]) -> tuple[str, list[dict]]:
-    weeks = [r["week"] for r in rows if r.get("week")]
-    if not weeks:
-        return "", []
-    latest_week = max(weeks)
+def filter_rows(rows: list[dict], latest_only: bool = True) -> tuple[list[str], list[dict]]:
+    """Filter to tracked countries. If latest_only, restrict to the most recent week."""
+    weeks_set = {r["week"] for r in rows if r.get("week")}
+    if not weeks_set:
+        return [], []
+    target_weeks: set[str] = {max(weeks_set)} if latest_only else weeks_set
     out: list[dict] = []
     for r in rows:
-        if r.get("week") != latest_week or r.get("country_name") not in TRACKED_COUNTRIES:
+        week = r.get("week")
+        if week not in target_weeks or r.get("country_name") not in TRACKED_COUNTRIES:
             continue
         category = "tv" if r.get("category", "").lower().startswith("tv") else "movie"
         # show_title is the canonical title for both films and TV series.
@@ -72,9 +74,9 @@ def filter_rows(rows: list[dict]) -> tuple[str, list[dict]]:
             "title": title,
             "weeks_in_top10": int(r.get("cumulative_weeks_in_top_10") or 0),
             "hours_viewed": int(r.get("weekly_hours_viewed") or 0),
-            "week": latest_week,
+            "week": week,
         })
-    return latest_week, out
+    return sorted(target_weeks), out
 
 
 def resolve_tmdb(
@@ -271,30 +273,16 @@ def upsert_scores(scores: list[dict], uri: str, db_name: str) -> dict:
         client.close()
 
 
-def run(api_key: str, mongo_uri: str, db_name: str, timeout: float) -> dict:
-    logger.info("loading artist index from %s.artists", db_name)
-    try:
-        by_tmdb_id = load_artist_index(mongo_uri, db_name)
-    except PyMongoError as exc:
-        logger.error("MongoDB load failed: %s", exc)
-        raise
-    logger.info("loaded %d Actor artists with tmdb_person_id", len(by_tmdb_id))
-
-    logger.info("fetching Netflix TSV")
-    week, entries = filter_rows(fetch_tsv())
-    if not entries:
-        logger.error("no entries after filtering -- aborting")
-        return {"week": "", "entries": 0, "matches": 0, "scored_artists": 0}
-    logger.info(
-        "week=%s entries=%d countries=%d",
-        week, len(entries), len({e["country"] for e in entries}),
-    )
-
-    session = requests.Session()
-    title_cache: dict[tuple[str, str], tuple[int, str, int | None] | None] = {}
-    cast_cache: dict[int, list[dict]] = {}
+def _match_week_entries(
+    session: requests.Session,
+    api_key: str,
+    by_tmdb_id: dict[int, dict],
+    entries: list[dict],
+    title_cache: dict,
+    cast_cache: dict,
+    timeout: float,
+) -> list[dict]:
     matches: list[dict] = []
-
     for entry in entries:
         cache_key = (entry["title"], entry["category"])
         if cache_key not in title_cache:
@@ -319,23 +307,96 @@ def run(api_key: str, mongo_uri: str, db_name: str, timeout: float) -> dict:
                     "english_name": artist.get("english_name"),
                     "korean_name": artist.get("korean_name"),
                 })
+    return matches
+
+
+def run(
+    api_key: str,
+    mongo_uri: str,
+    db_name: str,
+    timeout: float,
+    latest_only: bool = True,
+    apply_writes: bool = False,
+) -> dict:
+    """Run the pipeline for the latest week (default) or all weeks in the TSV.
+
+    If apply_writes is True, upsert each week's scores into Mongo as soon as they're
+    computed (preserves progress on long backfill runs).
+    """
+    logger.info("loading artist index from %s.artists", db_name)
+    try:
+        by_tmdb_id = load_artist_index(mongo_uri, db_name)
+    except PyMongoError as exc:
+        logger.error("MongoDB load failed: %s", exc)
+        raise
+    logger.info("loaded %d Actor artists with tmdb_person_id", len(by_tmdb_id))
+
+    logger.info("fetching Netflix TSV")
+    weeks, entries = filter_rows(fetch_tsv(), latest_only=latest_only)
+    if not entries:
+        logger.error("no entries after filtering -- aborting")
+        return {"weeks": [], "entries": 0, "matches": 0, "scored_docs": 0}
+
+    by_week: defaultdict[str, list[dict]] = defaultdict(list)
+    for e in entries:
+        by_week[e["week"]].append(e)
+
+    logger.info(
+        "scope: %d week(s), %d entries, %d countries",
+        len(weeks), len(entries), len({e["country"] for e in entries}),
+    )
+
+    session = requests.Session()
+    title_cache: dict[tuple[str, str], tuple[int, str, int | None] | None] = {}
+    cast_cache: dict[int, list[dict]] = {}
+    all_scores: list[dict] = []
+    total_matches = 0
+    write_totals = {"upserted": 0, "modified": 0, "matched": 0}
+
+    for i, week in enumerate(sorted(by_week.keys()), 1):
+        week_entries = by_week[week]
+        matches = _match_week_entries(
+            session, api_key, by_tmdb_id, week_entries, title_cache, cast_cache, timeout,
+        )
+        total_matches += len(matches)
+        week_scores = score_matches(matches)
+        all_scores.extend(week_scores)
+
+        if apply_writes and week_scores:
+            try:
+                stats = upsert_scores(week_scores, mongo_uri, db_name)
+            except PyMongoError as exc:
+                logger.error("upsert failed for week=%s: %s", week, exc)
+                raise
+            for k, v in stats.items():
+                write_totals[k] = write_totals.get(k, 0) + v
+
+        if i % 10 == 0 or i == len(by_week):
+            logger.info(
+                "progress: %d/%d weeks, latest week=%s -> %d scored docs (cache: %d titles, %d casts)",
+                i, len(by_week), week, len(week_scores), len(title_cache), len(cast_cache),
+            )
 
     resolved_count = sum(1 for v in title_cache.values() if v)
     logger.info(
-        "resolved %d/%d unique titles, fetched cast for %d, %d cast-to-artist matches",
-        resolved_count, len(title_cache), len(cast_cache), len(matches),
+        "totals: %d weeks, %d unique titles (%d resolved), %d casts cached, %d matches, %d scored docs",
+        len(by_week), len(title_cache), resolved_count, len(cast_cache),
+        total_matches, len(all_scores),
     )
 
-    scores = score_matches(matches)
-    return {
-        "week": week,
+    summary: dict = {
+        "weeks": weeks,
+        "weeks_count": len(weeks),
         "entries": len(entries),
         "unique_titles": len(title_cache),
         "resolved_titles": resolved_count,
-        "matches": len(matches),
-        "scored_artists": len(scores),
-        "scores": scores,
+        "matches": total_matches,
+        "scored_docs": len(all_scores),
+        "scores": all_scores,
     }
+    if apply_writes:
+        summary.update(write_totals)
+    return summary
 
 
 def _to_jsonable(value):
@@ -360,18 +421,16 @@ def print_samples(scores: list[dict], n: int = 3) -> None:
 
 
 def lambda_handler(event, context):  # noqa: ARG001 -- AWS Lambda signature
-    """AWS Lambda entry point. Always commits to MongoDB."""
+    """AWS Lambda entry point. Always commits to MongoDB (latest week only)."""
     api_key = os.environ["TMDB_API_KEY"]
     mongo_uri = os.environ.get("ARTISTS_MONGODB_URI") or os.environ["MONGODB_URI"]
     db_name = os.environ.get("ARTISTS_SOURCE_DATABASE", "general")
     timeout = float(os.environ.get("TMDB_TIMEOUT", "10"))
 
-    result = run(api_key, mongo_uri, db_name, timeout)
-    scores = result.pop("scores", [])
-    write_stats = upsert_scores(scores, mongo_uri, db_name)
-    summary = {**result, **write_stats}
-    logger.info("lambda done: %s", summary)
-    return {"statusCode": 200, "body": summary}
+    result = run(api_key, mongo_uri, db_name, timeout, latest_only=True, apply_writes=True)
+    result.pop("scores", None)
+    logger.info("lambda done: %s", result)
+    return {"statusCode": 200, "body": result}
 
 
 def main() -> int:
@@ -381,7 +440,9 @@ def main() -> int:
     parser.add_argument("--db", default=os.environ.get("ARTISTS_SOURCE_DATABASE", "general"))
     parser.add_argument("--timeout", type=float, default=10.0)
     parser.add_argument("--samples", type=int, default=3, help="how many sample docs to print")
-    parser.add_argument("--apply", action="store_true", help="commit upserts (default: dry-run preview)")
+    parser.add_argument("--apply", action="store_true", help="commit upserts (default: dry-run)")
+    parser.add_argument("--all-weeks", action="store_true",
+                        help="process every week in the TSV (default: latest only)")
     args = parser.parse_args()
 
     if not args.api_key:
@@ -391,20 +452,22 @@ def main() -> int:
         logger.error("Mongo URI is required (ARTISTS_MONGODB_URI / MONGODB_URI or --uri)")
         return 2
 
-    result = run(args.api_key, args.uri, args.db, args.timeout)
+    try:
+        result = run(
+            args.api_key, args.uri, args.db, args.timeout,
+            latest_only=not args.all_weeks,
+            apply_writes=args.apply,
+        )
+    except PyMongoError as exc:
+        logger.error("aborted: %s", exc)
+        return 1
     scores = result.pop("scores", [])
     print_samples(scores, n=args.samples)
 
     if args.apply:
-        try:
-            write_stats = upsert_scores(scores, args.uri, args.db)
-        except PyMongoError as exc:
-            logger.error("upsert failed: %s", exc)
-            return 1
-        result.update(write_stats)
         logger.info("done (committed): %s", result)
     else:
-        logger.info("DRY-RUN: %d scores ready to upsert (pass --apply to commit)", len(scores))
+        logger.info("DRY-RUN: %d scored docs ready to upsert (pass --apply to commit)", len(scores))
         logger.info("done: %s", result)
     return 0
 
