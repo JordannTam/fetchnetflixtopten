@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from difflib import SequenceMatcher
 
 import requests
+from bson import ObjectId
 
 from src.config import NetflixConfig
 from src.models import ContentRef, CountryRanking
@@ -47,6 +48,12 @@ class ArtistLinkingResult:
 def _normalize_name(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", value or "").casefold()
     return _NORMALIZE_PATTERN.sub("", normalized)
+
+
+def _artist_key(artist: dict) -> ObjectId:
+    # Artists are uniquely identified by the Mongo _id (ObjectId).
+    # Caller must ensure the doc has _id (every Mongo doc does).
+    return artist["_id"]
 
 
 def _rank_score(rank: int) -> int:
@@ -114,14 +121,13 @@ def _tmdb_credits(
     return tuple(response.json().get("cast", []))
 
 
-def _index_artists(artists: tuple[dict, ...]) -> tuple[dict[str, list[dict]], dict[str, dict]]:
+def _index_artists(artists: tuple[dict, ...]) -> tuple[dict[str, list[dict]], dict[ObjectId, dict]]:
     by_name: dict[str, list[dict]] = {}
-    by_id: dict[str, dict] = {}
+    by_id: dict[ObjectId, dict] = {}
     for artist in artists:
-        artist_id_value = artist.get("artist_id", artist.get("_id"))
-        if artist_id_value is None:
+        if "_id" not in artist:
             continue
-        artist_id = str(artist_id_value)
+        artist_id = _artist_key(artist)
         by_id[artist_id] = artist
         aliases = artist.get("aliases") or ()
         normalized_aliases = artist.get("normalized_aliases") or ()
@@ -241,9 +247,9 @@ def _process_exact_candidates(
     ranking: CountryRanking,
     entry: object,
     provider_content_id: str,
-    link_docs: dict[tuple[str, str, str, str], dict],
-    review_docs: dict[tuple[str, str, str, str, str, str], dict],
-) -> tuple[list[str], bool]:
+    link_docs: dict[tuple[str, str, ObjectId, str], dict],
+    review_docs: dict[tuple[str, str, str, str, str, ObjectId], dict],
+) -> tuple[list[ObjectId], bool]:
     """Route exact-match candidates: auto-link singletons, queue ambiguous multiples.
 
     Returns (new_artist_ids, has_ambiguous).
@@ -253,19 +259,19 @@ def _process_exact_candidates(
         tenant_id = str(candidate.get("tenant_id", ""))
         candidates_by_tenant.setdefault(tenant_id, []).append(candidate)
 
-    new_artist_ids: list[str] = []
+    new_artist_ids: list[ObjectId] = []
     has_ambiguous = False
 
     for tenant_id, tenant_candidates in candidates_by_tenant.items():
         if len(tenant_candidates) == 1:
             artist = tenant_candidates[0]
-            artist_id = str(artist.get("artist_id", artist.get("_id")))
+            artist_id = _artist_key(artist)
             new_artist_ids.append(artist_id)
             link_docs[(tenant_id, provider_content_id, artist_id, "cast")] = {
                 "tenant_id": artist.get("tenant_id"),
                 "content_provider": "tmdb",
                 "content_id": provider_content_id,
-                "artist_id": artist.get("artist_id", artist.get("_id")),
+                "artist_id": artist_id,
                 "role": "cast",
                 "character_name": credit.get("character"),
                 "billing_order": credit.get("order"),
@@ -276,7 +282,7 @@ def _process_exact_candidates(
             }
         else:
             for candidate in tenant_candidates:
-                candidate_artist_id = str(candidate.get("artist_id", candidate.get("_id")))
+                candidate_artist_id = _artist_key(candidate)
                 review_key = (
                     tenant_id,
                     ranking.week,
@@ -292,7 +298,7 @@ def _process_exact_candidates(
                     "category": ranking.category,
                     "rank_title": entry.title,
                     "credit_name": credit_name,
-                    "candidate_artist_id": candidate.get("artist_id", candidate.get("_id")),
+                    "candidate_artist_id": candidate_artist_id,
                     "confidence": 0.99,
                     "status": "pending",
                     "created_at": datetime.now(timezone.utc),
@@ -309,14 +315,14 @@ def _match_credits_to_artists(
     provider_content_id: str,
     normalized_artist_names: dict[str, list[dict]],
     config: NetflixConfig,
-    link_docs: dict[tuple[str, str, str, str], dict],
-    review_docs: dict[tuple[str, str, str, str, str, str], dict],
-) -> tuple[list[str], bool, int]:
+    link_docs: dict[tuple[str, str, ObjectId, str], dict],
+    review_docs: dict[tuple[str, str, str, str, str, ObjectId], dict],
+) -> tuple[list[ObjectId], bool, int]:
     """Match all credits for an entry against tracked artists.
 
     Returns (linked_artist_ids, has_ambiguous, ambiguous_count).
     """
-    linked_artist_ids: list[str] = []
+    linked_artist_ids: list[ObjectId] = []
     has_ambiguous = False
     ambiguous_count = 0
 
@@ -327,10 +333,10 @@ def _match_credits_to_artists(
             continue
 
         exact_raw = normalized_artist_names.get(normalized_credit, [])
-        seen_ids: set[str] = set()
+        seen_ids: set[ObjectId] = set()
         exact_candidates: list[dict] = []
         for candidate in exact_raw:
-            cid = str(candidate.get("artist_id", candidate.get("_id")))
+            cid = _artist_key(candidate)
             if cid not in seen_ids:
                 seen_ids.add(cid)
                 exact_candidates.append(candidate)
@@ -351,7 +357,7 @@ def _match_credits_to_artists(
         best_artist, fuzzy_score = _best_fuzzy_match(normalized_credit, normalized_artist_names)
         if best_artist and fuzzy_score >= config.fuzzy_review_threshold:
             tenant_id = str(best_artist.get("tenant_id", ""))
-            candidate_artist_id = str(best_artist.get("artist_id", best_artist.get("_id")))
+            candidate_artist_id = _artist_key(best_artist)
             review_key = (
                 tenant_id,
                 ranking.week,
@@ -367,7 +373,7 @@ def _match_credits_to_artists(
                 "category": ranking.category,
                 "rank_title": entry.title,
                 "credit_name": credit_name,
-                "candidate_artist_id": best_artist.get("artist_id", best_artist.get("_id")),
+                "candidate_artist_id": candidate_artist_id,
                 "confidence": round(fuzzy_score, 4),
                 "status": "pending",
                 "created_at": datetime.now(timezone.utc),
@@ -379,12 +385,12 @@ def _match_credits_to_artists(
 
 
 def _accumulate_artist_scores(
-    linked_artist_ids: list[str],
+    linked_artist_ids: list[ObjectId],
     entry: object,
     ranking: CountryRanking,
     content_ref: ContentRef,
-    artists_by_id: dict[str, dict],
-    title_score_max: dict[tuple[str, str, str, int, str, str], float],
+    artists_by_id: dict[ObjectId, dict],
+    title_score_max: dict[tuple[str, ObjectId, str, int, str, str], float],
     weeks_cap: int,
 ) -> bool:
     """Update title_score_max for each linked artist. Returns False if week is invalid."""
@@ -417,9 +423,9 @@ def link_rankings_to_artists(
     normalized_artist_names, artists_by_id = _index_artists(artists)
 
     content_docs: dict[tuple[str, str], dict] = {}
-    link_docs: dict[tuple[str, str, str, str], dict] = {}
-    review_docs: dict[tuple[str, str, str, str, str, str], dict] = {}
-    title_score_max: dict[tuple[str, str, str, int, str, str], float] = {}
+    link_docs: dict[tuple[str, str, ObjectId, str], dict] = {}
+    review_docs: dict[tuple[str, str, str, str, str, ObjectId], dict] = {}
+    title_score_max: dict[tuple[str, ObjectId, str, int, str, str], float] = {}
     search_cache: dict[tuple[str, str], dict | None] = {}
     credits_cache: dict[str, tuple[dict, ...]] = {}
 
@@ -490,7 +496,7 @@ def link_rankings_to_artists(
 
         enriched_rankings.append(replace(ranking, rankings=tuple(updated_entries)))
 
-    score_accumulator: dict[tuple[str, str, str, int, str], float] = {}
+    score_accumulator: dict[tuple[str, ObjectId, str, int, str], float] = {}
     for title_key, contribution in title_score_max.items():
         tenant_key, artist_id, year, week, country, _ = title_key
         score_key = (tenant_key, artist_id, year, week, country)
@@ -515,21 +521,29 @@ def link_rankings_to_artists(
 
 
 def _build_drama_score_docs(
-    score_accumulator: dict[tuple[str, str, str, int, str], float],
-    artists_by_id: dict[str, dict],
+    score_accumulator: dict[tuple[str, ObjectId, str, int, str], float],
+    artists_by_id: dict[ObjectId, dict],
 ) -> list[dict]:
-    by_scope: dict[tuple[str, str, int, str], list[tuple[tuple[str, str, str, int, str], float]]] = {}
+    by_scope: dict[
+        tuple[str, str, int, str],
+        list[tuple[tuple[str, ObjectId, str, int, str], float]],
+    ] = {}
     for key, score in score_accumulator.items():
         tenant_id, _, year, week, country = key
         by_scope.setdefault((tenant_id, year, week, country), []).append((key, score))
 
     docs: list[dict] = []
     now = datetime.now(timezone.utc)
-    for scope_key, values in by_scope.items():
+    for values in by_scope.values():
         max_score = max(score for _, score in values)
         for key, score in values:
-            tenant_id, artist_id, year, week, country = key
-            artist = artists_by_id.get(artist_id, {})
+            _, artist_id, year, week, country = key
+            artist = artists_by_id.get(artist_id)
+            if not artist:
+                logger.warning(
+                    "Skipping drama score doc: artist_id %s not in index", artist_id
+                )
+                continue
             # Ratio normalization: score as % of the top performer in this tenant-week scope.
             # Preserves absolute meaning — 0 = no contribution, 100 = best this week.
             # Min-max was discarded because it maps the lowest scorer to 0.0 regardless
@@ -537,8 +551,8 @@ def _build_drama_score_docs(
             normalized = 100.0 if max_score == 0 else (score / max_score) * 100
             docs.append(
                 {
-                    "tenant_id": artist.get("tenant_id") if tenant_id else None,
-                    "artist_id": artist.get("artist_id", artist.get("_id")),
+                    "tenant_id": artist.get("tenant_id") or None,
+                    "artist_id": _artist_key(artist),
                     "english_name": artist.get("english_name", ""),
                     "korean_name": artist.get("korean_name", ""),
                     "type": artist.get("type", []),

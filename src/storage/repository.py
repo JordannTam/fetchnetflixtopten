@@ -178,10 +178,10 @@ class RankingsRepository:
         logger.info("Saved scrape run %s", run.run_id)
 
     def load_tracked_artists(self, mongo_session=None) -> tuple[dict, ...]:
+        # _id is included by default in projections; we use it as the canonical artist key.
         cursor = self._artists.find(
             {"is_active": {"$ne": False}},
             {
-                "artist_id": 1,
                 "english_name": 1,
                 "korean_name": 1,
                 "aliases": 1,

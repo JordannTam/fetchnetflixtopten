@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from bson import ObjectId
+
 
 @dataclass(frozen=True)
 class ContentRef:
@@ -42,7 +44,7 @@ class RankingEntry:
     hours_viewed: int = 0
     content_ref: ContentRef | None = None
     match_status: str = "unmatched"
-    linked_artist_ids: tuple[str, ...] = ()
+    linked_artist_ids: tuple[ObjectId, ...] = ()
 
     def to_document(self) -> dict:
         """Convert to a MongoDB-ready dict. Omits hours_viewed if zero."""

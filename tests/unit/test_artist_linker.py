@@ -1,5 +1,7 @@
 from unittest.mock import MagicMock
 
+from bson import ObjectId
+
 from src.config import NetflixConfig
 from src.linking.artist_linker import _build_drama_score_docs, link_rankings_to_artists
 from src.models import CountryRanking, RankingEntry
@@ -13,6 +15,7 @@ def _make_response(payload: dict):
 
 
 def test_link_rankings_matches_artist_by_alias():
+    oid = ObjectId()
     ranking = CountryRanking(
         week="2026-02-01",
         country="south-korea",
@@ -38,7 +41,7 @@ def test_link_rankings_matches_artist_by_alias():
     repo = MagicMock()
     repo.load_tracked_artists.return_value = (
         {
-            "artist_id": "1297",
+            "_id": oid,
             "english_name": "t024",
             "korean_name": "티공이사",
             "aliases": ["T-024"],
@@ -53,7 +56,7 @@ def test_link_rankings_matches_artist_by_alias():
     enriched = result.rankings[0].rankings[0]
     assert enriched.match_status == "matched"
     assert enriched.content_ref is not None
-    assert "1297" in enriched.linked_artist_ids
+    assert oid in enriched.linked_artist_ids
     assert len(result.content_docs) == 1
     assert len(result.link_docs) == 1
     assert len(result.drama_score_docs) == 1
@@ -96,8 +99,8 @@ def test_exact_alias_collision_goes_to_review_queue():
     ]
     repo = MagicMock()
     repo.load_tracked_artists.return_value = (
-        {"artist_id": "a1", "aliases": ["Shared Alias"], "tenant_id": "t1"},
-        {"artist_id": "a2", "aliases": ["Shared Alias"], "tenant_id": "t1"},
+        {"_id": ObjectId(), "aliases": ["Shared Alias"], "tenant_id": "t1"},
+        {"_id": ObjectId(), "aliases": ["Shared Alias"], "tenant_id": "t1"},
     )
 
     result = link_rankings_to_artists(
@@ -110,19 +113,21 @@ def test_exact_alias_collision_goes_to_review_queue():
 
 
 def test_drama_score_normalization_is_tenant_scoped():
+    oid_a = ObjectId()
+    oid_b = ObjectId()
     docs = _build_drama_score_docs(
         {
-            ("tenant-a", "artist-a", "2026", 1, "GLOBAL"): 10.0,
-            ("tenant-b", "artist-b", "2026", 1, "GLOBAL"): 40.0,
+            ("tenant-a", oid_a, "2026", 1, "GLOBAL"): 10.0,
+            ("tenant-b", oid_b, "2026", 1, "GLOBAL"): 40.0,
         },
         {
-            "artist-a": {"artist_id": "artist-a", "tenant_id": "tenant-a"},
-            "artist-b": {"artist_id": "artist-b", "tenant_id": "tenant-b"},
+            oid_a: {"_id": oid_a, "tenant_id": "tenant-a"},
+            oid_b: {"_id": oid_b, "tenant_id": "tenant-b"},
         },
     )
-    normalized = {str(doc["artist_id"]): doc["netflix_normalized"] for doc in docs}
-    assert normalized["artist-a"] == 100.0
-    assert normalized["artist-b"] == 100.0
+    normalized = {doc["artist_id"]: doc["netflix_normalized"] for doc in docs}
+    assert normalized[oid_a] == 100.0
+    assert normalized[oid_b] == 100.0
 
 
 def test_exact_alias_across_tenants_auto_links_each_tenant():
@@ -139,10 +144,12 @@ def test_exact_alias_across_tenants_auto_links_each_tenant():
         _make_response({"results": [{"id": 123, "name": "Sample Drama"}]}),
         _make_response({"cast": [{"name": "JISOO"}]}),
     ]
+    oid_a = ObjectId()
+    oid_b = ObjectId()
     repo = MagicMock()
     repo.load_tracked_artists.return_value = (
-        {"artist_id": "452", "english_name": "Jisoo", "tenant_id": "tenant-a"},
-        {"artist_id": "673", "english_name": "Jisoo", "tenant_id": "tenant-b"},
+        {"_id": oid_a, "english_name": "Jisoo", "tenant_id": "tenant-a"},
+        {"_id": oid_b, "english_name": "Jisoo", "tenant_id": "tenant-b"},
     )
 
     result = link_rankings_to_artists(
@@ -150,8 +157,36 @@ def test_exact_alias_across_tenants_auto_links_each_tenant():
     )
     entry = result.rankings[0].rankings[0]
     assert entry.match_status == "matched"
-    assert set(entry.linked_artist_ids) == {"452", "673"}
+    assert set(entry.linked_artist_ids) == {oid_a, oid_b}
     assert result.review_docs == ()
+
+
+def test_artist_without_id_is_skipped():
+    """Artists missing _id are filtered out (defensive guard)."""
+    ranking = CountryRanking(
+        week="2026-02-01",
+        country="south-korea",
+        country_name="South Korea",
+        category="tv",
+        source="tsv",
+        rankings=(RankingEntry(rank=1, title="Sample Drama", weeks_in_top_10=1),),
+    )
+    session = MagicMock()
+    session.get.side_effect = [
+        _make_response({"results": [{"id": 123, "name": "Sample Drama"}]}),
+        _make_response({"cast": [{"name": "Hyun Bin"}]}),
+    ]
+    repo = MagicMock()
+    repo.load_tracked_artists.return_value = (
+        {"english_name": "Hyun Bin", "tenant_id": "tenant-1"},  # no _id
+    )
+
+    result = link_rankings_to_artists(
+        (ranking,), session, NetflixConfig(tmdb_api_key="x"), repo
+    )
+    entry = result.rankings[0].rankings[0]
+    assert entry.match_status == "unmatched"
+    assert entry.linked_artist_ids == ()
 
 
 def test_global_score_dedupes_same_content_across_countries():
@@ -180,7 +215,7 @@ def test_global_score_dedupes_same_content_across_countries():
     ]
     repo = MagicMock()
     repo.load_tracked_artists.return_value = (
-        {"artist_id": "a1", "english_name": "Actor A", "tenant_id": "tenant-a"},
+        {"_id": ObjectId(), "english_name": "Actor A", "tenant_id": "tenant-a"},
     )
 
     result = link_rankings_to_artists(
