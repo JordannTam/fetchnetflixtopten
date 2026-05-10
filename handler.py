@@ -156,6 +156,8 @@ def score_matches(matches: list[dict]) -> list[dict]:
                 "tmdb_id": m["tmdb_id"],
                 "title": m["title"],
                 "release_year": m.get("release_year"),
+                "country": m["country"],            # country whose chart row produced the max DP
+                "rank": m["rank"],                  # rank in that country (helpful for debugging)
                 "contribution": dp,
             }
         artist_meta[artist_id] = m
@@ -186,6 +188,8 @@ def score_matches(matches: list[dict]) -> list[dict]:
                     "tmdb_id": d["tmdb_id"],
                     "title": d["title"],
                     "release_year": d.get("release_year"),
+                    "country": d["country"],
+                    "rank": d["rank"],
                     "contribution": round(d["contribution"], 2),
                 }
                 for d in sorted(dramas, key=lambda x: -x["contribution"])
