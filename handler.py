@@ -22,15 +22,17 @@ import logging
 import os
 import sys
 from collections import defaultdict
-from pathlib import Path
+from datetime import datetime, timezone
 
 import requests
-from pymongo import MongoClient
+from pymongo import MongoClient, UpdateOne
 from pymongo.errors import PyMongoError
 from requests.exceptions import RequestException
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("scrape_netflix")
+
+ARTIST_DP_COLLECTION = "artist_dp_netflix"
 
 TSV_URL = "https://www.netflix.com/tudum/top10/data/all-weeks-countries.tsv"
 TMDB_BASE = "https://api.themoviedb.org/3"
@@ -77,7 +79,8 @@ def filter_rows(rows: list[dict]) -> tuple[str, list[dict]]:
 
 def resolve_tmdb(
     session: requests.Session, api_key: str, title: str, category: str, timeout: float
-) -> tuple[int, str] | None:
+) -> tuple[int, str, int | None] | None:
+    """Returns (tmdb_id, media_type, release_year) for the first search hit, or None."""
     media_type = "tv" if category == "tv" else "movie"
     try:
         r = session.get(
@@ -90,7 +93,12 @@ def resolve_tmdb(
     except RequestException as exc:
         logger.warning("TMDB search failed for '%s' (%s): %s", title, media_type, exc)
         return None
-    return (results[0]["id"], media_type) if results else None
+    if not results:
+        return None
+    hit = results[0]
+    date_str = hit.get("release_date") if media_type == "movie" else hit.get("first_air_date")
+    release_year = int(date_str[:4]) if date_str and len(date_str) >= 4 and date_str[:4].isdigit() else None
+    return hit["id"], media_type, release_year
 
 
 def fetch_cast(
@@ -123,10 +131,17 @@ def load_artist_index(uri: str, db_name: str) -> dict[int, dict]:
 
 
 def score_matches(matches: list[dict]) -> list[dict]:
-    """Per-artist: max DP per (artist, title) across countries, then sum across titles."""
-    by_artist_title: dict[tuple[str, int], float] = {}
+    """Per-artist: max DP per (artist, title) across countries, then sum across titles.
+
+    Returns one doc per artist with embedded drama breakdown:
+      {
+        artist_id, tenant_id, english_name, korean_name, week,
+        dp_netflix,                       # total across distinct titles
+        dramas: [{tmdb_id, title, contribution}, ...]
+      }
+    """
+    by_artist_title: dict[tuple[str, int], dict] = {}
     artist_meta: dict[str, dict] = {}
-    artist_titles: defaultdict[str, set[str]] = defaultdict(set)
 
     for m in matches:
         # Rank Score: rank 1 = 200, rank 2 = 199, ..., rank 10 = 191.
@@ -135,30 +150,92 @@ def score_matches(matches: list[dict]) -> list[dict]:
         dp = rank_score + m["weeks_in_top10"] * 10 + m["hours_viewed"] / 1_000_000
         artist_id = str(m["artist_id"])
         key = (artist_id, m["tmdb_id"])
-        if dp > by_artist_title.get(key, 0):
-            by_artist_title[key] = dp
+        existing = by_artist_title.get(key)
+        if existing is None or dp > existing["contribution"]:
+            by_artist_title[key] = {
+                "tmdb_id": m["tmdb_id"],
+                "title": m["title"],
+                "release_year": m.get("release_year"),
+                "contribution": dp,
+            }
         artist_meta[artist_id] = m
-        artist_titles[artist_id].add(m["title"])
 
-    totals: defaultdict[str, float] = defaultdict(float)
-    for (artist_id, _), dp in by_artist_title.items():
-        totals[artist_id] += dp
+    artist_dramas: defaultdict[str, list[dict]] = defaultdict(list)
+    for (artist_id, _), drama in by_artist_title.items():
+        artist_dramas[artist_id].append(drama)
 
-    return [
-        {
-            "artist_id": artist_id,
-            "tenant_id": str(artist_meta[artist_id].get("tenant_id", "")),
-            "english_name": artist_meta[artist_id].get("english_name"),
-            "korean_name": artist_meta[artist_id].get("korean_name"),
-            "week": artist_meta[artist_id]["week"],
+    out: list[dict] = []
+    for artist_id, dramas in artist_dramas.items():
+        total = sum(d["contribution"] for d in dramas)
+        meta = artist_meta[artist_id]
+        week_date = meta["week"]
+        # ISO week number: 1..52 (or 53). isocalendar().year handles edge cases
+        # where a date in early Jan or late Dec belongs to the prior/next ISO year.
+        iso = datetime.strptime(week_date, "%Y-%m-%d").date().isocalendar()
+        out.append({
+            "artist_id": meta["artist_id"],          # ObjectId
+            "tenant_id": meta.get("tenant_id"),      # ObjectId or None
+            "english_name": meta.get("english_name"),
+            "korean_name": meta.get("korean_name"),
+            "year": iso.year,
+            "week": iso.week,
+            "week_date": week_date,                  # original chart-end date (Sunday)
             "dp_netflix": round(total, 2),
-            "matched_titles": sorted(artist_titles[artist_id]),
+            "dramas": [
+                {
+                    "tmdb_id": d["tmdb_id"],
+                    "title": d["title"],
+                    "release_year": d.get("release_year"),
+                    "contribution": round(d["contribution"], 2),
+                }
+                for d in sorted(dramas, key=lambda x: -x["contribution"])
+            ],
+        })
+    return sorted(out, key=lambda x: -x["dp_netflix"])
+
+
+def upsert_scores(scores: list[dict], uri: str, db_name: str) -> dict:
+    """Bulk upsert into general.artist_dp_netflix keyed by (tenant_id, artist_id, year, week).
+
+    Idempotent: re-running the same (year, week) overwrites the doc.
+    """
+    if not scores:
+        return {"upserted": 0, "modified": 0, "matched": 0}
+
+    now = datetime.now(timezone.utc)
+    client = MongoClient(uri)
+    try:
+        coll = client[db_name][ARTIST_DP_COLLECTION]
+        # Idempotent: create_index is a no-op if the index already exists.
+        coll.create_index(
+            [("tenant_id", 1), ("artist_id", 1), ("year", 1), ("week", 1)],
+            unique=True,
+            name="tenant_artist_year_week_unique",
+        )
+        operations = [
+            UpdateOne(
+                {
+                    "tenant_id": s["tenant_id"],
+                    "artist_id": s["artist_id"],
+                    "year": s["year"],
+                    "week": s["week"],
+                },
+                {"$set": {**s, "updated_at": now}},
+                upsert=True,
+            )
+            for s in scores
+        ]
+        result = coll.bulk_write(operations, ordered=False)
+        return {
+            "upserted": result.upserted_count,
+            "modified": result.modified_count,
+            "matched": result.matched_count,
         }
-        for artist_id, total in sorted(totals.items(), key=lambda kv: -kv[1])
-    ]
+    finally:
+        client.close()
 
 
-def run(api_key: str, mongo_uri: str, db_name: str, output_path: Path, timeout: float) -> dict:
+def run(api_key: str, mongo_uri: str, db_name: str, timeout: float) -> dict:
     logger.info("loading artist index from %s.artists", db_name)
     try:
         by_tmdb_id = load_artist_index(mongo_uri, db_name)
@@ -178,7 +255,7 @@ def run(api_key: str, mongo_uri: str, db_name: str, output_path: Path, timeout: 
     )
 
     session = requests.Session()
-    title_cache: dict[tuple[str, str], tuple[int, str] | None] = {}
+    title_cache: dict[tuple[str, str], tuple[int, str, int | None] | None] = {}
     cast_cache: dict[int, list[dict]] = {}
     matches: list[dict] = []
 
@@ -191,7 +268,7 @@ def run(api_key: str, mongo_uri: str, db_name: str, output_path: Path, timeout: 
         resolved = title_cache[cache_key]
         if not resolved:
             continue
-        tmdb_id, media_type = resolved
+        tmdb_id, media_type, release_year = resolved
         if tmdb_id not in cast_cache:
             cast_cache[tmdb_id] = fetch_cast(session, api_key, tmdb_id, media_type, timeout)
         for member in cast_cache[tmdb_id]:
@@ -200,6 +277,7 @@ def run(api_key: str, mongo_uri: str, db_name: str, output_path: Path, timeout: 
                 matches.append({
                     **entry,
                     "tmdb_id": tmdb_id,
+                    "release_year": release_year,
                     "artist_id": artist["_id"],
                     "tenant_id": artist.get("tenant_id"),
                     "english_name": artist.get("english_name"),
@@ -213,11 +291,6 @@ def run(api_key: str, mongo_uri: str, db_name: str, output_path: Path, timeout: 
     )
 
     scores = score_matches(matches)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w") as f:
-        json.dump({"week": week, "scores": scores}, f, indent=2, ensure_ascii=False, default=str)
-    logger.info("wrote %d artist scores -> %s", len(scores), output_path)
-
     return {
         "week": week,
         "entries": len(entries),
@@ -225,7 +298,44 @@ def run(api_key: str, mongo_uri: str, db_name: str, output_path: Path, timeout: 
         "resolved_titles": resolved_count,
         "matches": len(matches),
         "scored_artists": len(scores),
+        "scores": scores,
     }
+
+
+def _to_jsonable(value):
+    """Convert ObjectId / unknown types to str for pretty-printing."""
+    if isinstance(value, dict):
+        return {k: _to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_to_jsonable(v) for v in value]
+    return str(value) if value.__class__.__name__ == "ObjectId" else value
+
+
+def print_samples(scores: list[dict], n: int = 3) -> None:
+    """Print n sample documents in the proposed Mongo doc shape."""
+    print()
+    print("=" * 70)
+    print(f"Sample of {min(n, len(scores))} documents (proposed shape for general.artist_dp_netflix)")
+    print("=" * 70)
+    for i, score in enumerate(scores[:n], 1):
+        print(f"\n--- Sample {i} ---")
+        print(json.dumps(_to_jsonable(score), indent=2, ensure_ascii=False))
+    print()
+
+
+def lambda_handler(event, context):  # noqa: ARG001 -- AWS Lambda signature
+    """AWS Lambda entry point. Always commits to MongoDB."""
+    api_key = os.environ["TMDB_API_KEY"]
+    mongo_uri = os.environ.get("ARTISTS_MONGODB_URI") or os.environ["MONGODB_URI"]
+    db_name = os.environ.get("ARTISTS_SOURCE_DATABASE", "general")
+    timeout = float(os.environ.get("TMDB_TIMEOUT", "10"))
+
+    result = run(api_key, mongo_uri, db_name, timeout)
+    scores = result.pop("scores", [])
+    write_stats = upsert_scores(scores, mongo_uri, db_name)
+    summary = {**result, **write_stats}
+    logger.info("lambda done: %s", summary)
+    return {"statusCode": 200, "body": summary}
 
 
 def main() -> int:
@@ -233,8 +343,9 @@ def main() -> int:
     parser.add_argument("--api-key", default=os.environ.get("TMDB_API_KEY"))
     parser.add_argument("--uri", default=os.environ.get("ARTISTS_MONGODB_URI") or os.environ.get("MONGODB_URI"))
     parser.add_argument("--db", default=os.environ.get("ARTISTS_SOURCE_DATABASE", "general"))
-    parser.add_argument("--output", default="out/artist_scores.json")
     parser.add_argument("--timeout", type=float, default=10.0)
+    parser.add_argument("--samples", type=int, default=3, help="how many sample docs to print")
+    parser.add_argument("--apply", action="store_true", help="commit upserts (default: dry-run preview)")
     args = parser.parse_args()
 
     if not args.api_key:
@@ -244,8 +355,21 @@ def main() -> int:
         logger.error("Mongo URI is required (ARTISTS_MONGODB_URI / MONGODB_URI or --uri)")
         return 2
 
-    stats = run(args.api_key, args.uri, args.db, Path(args.output), args.timeout)
-    logger.info("done: %s", stats)
+    result = run(args.api_key, args.uri, args.db, args.timeout)
+    scores = result.pop("scores", [])
+    print_samples(scores, n=args.samples)
+
+    if args.apply:
+        try:
+            write_stats = upsert_scores(scores, args.uri, args.db)
+        except PyMongoError as exc:
+            logger.error("upsert failed: %s", exc)
+            return 1
+        result.update(write_stats)
+        logger.info("done (committed): %s", result)
+    else:
+        logger.info("DRY-RUN: %d scores ready to upsert (pass --apply to commit)", len(scores))
+        logger.info("done: %s", result)
     return 0
 
 

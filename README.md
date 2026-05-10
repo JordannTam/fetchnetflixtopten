@@ -1,10 +1,15 @@
-# Artist Alias Backfill
+# Netflix Top 10 → DP_Netflix Pipeline
 
-Scripts for populating TMDB-derived aliases on the `general.artists` collection. Reads each `Actor` artist, searches TMDB for the corresponding person, verifies the match by Korean name, and writes verified aliases back to MongoDB.
+Weekly pipeline that scores tracked Korean actors based on Netflix Top 10 chart performance.
 
-## Why
+```
+Netflix TSV ─→ TMDB resolve title ─→ TMDB cast ─→ match by tmdb_person_id ─→ DP_Netflix → MongoDB
+```
 
-Tracked artists (Korean actors) need rich alias coverage so that downstream cast-credit matching can resolve names across romanizations (`Lee Jung-jae` / `Yi Jung-jae` / `Jungjae Lee` / `이정재` / `李政宰`). Hand-curating ~1100 actors doesn't scale; TMDB's `also_known_as` field already contains these variants. This project automates the backfill with safeguards against the failure modes that come with naive name search (mononym ambiguity, group-name pollution, wrong-person matches).
+Two parts:
+
+1. **`handler.py`** — the pipeline (also runnable as an AWS Lambda).
+2. **`scripts/`** — alias maintenance for `general.artists` (a prerequisite — actors need `tmdb_person_id` populated for the pipeline to match them).
 
 ## Setup
 
@@ -13,103 +18,136 @@ pip install -r requirements.txt
 cp .env.example .env  # fill in TMDB_API_KEY and ARTISTS_MONGODB_URI
 ```
 
-## Usage
+Required env: `TMDB_API_KEY`, `ARTISTS_MONGODB_URI` (or `MONGODB_URI`). Optional: `ARTISTS_SOURCE_DATABASE` (default `general`), `TMDB_TIMEOUT` (default `10`).
 
-Both scripts dry-run by default. Pass `--apply` to commit.
-
-### Backfill aliases
+## Running the pipeline
 
 ```bash
-# Test on 10 actors (dry run)
-python3 scripts/backfill_aliases_from_tmdb.py --limit 10
+# Dry-run: print 3 sample documents, no DB writes
+python3 handler.py
 
-# Test on 10 actors and commit
+# Commit: upsert all scores into general.artist_dp_netflix
+python3 handler.py --apply
+
+# Quiet apply (skip sample preview)
+python3 handler.py --apply --samples 0
+```
+
+CLI flags:
+- `--apply` — commit upserts (default: dry-run preview)
+- `--samples N` — how many sample docs to print (default 3)
+- `--api-key`, `--uri`, `--db`, `--timeout` — override env vars
+
+The Lambda entry (`handler.lambda_handler`) always commits — there's no dry-run for invocations.
+
+## What gets written
+
+Collection: `general.artist_dp_netflix`
+Unique key: `(tenant_id, artist_id, year, week)`
+Index: `tenant_artist_year_week_unique` (created on first write)
+
+```js
+{
+  artist_id:    ObjectId("..."),
+  tenant_id:    ObjectId("..."),
+  year:         2026,
+  week:         18,                   // ISO week number
+  week_date:    "2026-05-03",         // chart-end Sunday
+  english_name: "Go YounJung",
+  korean_name:  "고윤정",
+  dp_netflix:   552.0,
+  dramas: [
+    {
+      tmdb_id:      229891,
+      title:        "Can This Love Be Translated?",
+      release_year: 2026,
+      contribution: 323.0
+    },
+    ...
+  ],
+  updated_at:   ISODate(...)
+}
+```
+
+## Scoring formula
+
+```
+Rank Score = 201 - rank             (rank 1 = 200, rank 10 = 191)
+DP_Netflix = Rank Score
+           + (Weeks on Chart × 10)
+           + (Streamed Hours / 1,000,000)
+```
+
+Per artist: take the **max** contribution per `tmdb_id` across countries (a single drama appearing in 5 countries' top 10 isn't double-counted), then **sum** across distinct titles for that artist.
+
+`DP_Spotify_OST` and `DP_IG_Hashtags` are sourced from other collections; `DP = DP_Netflix + DP_Spotify_OST + DP_IG_Hashtags` happens downstream.
+
+## Pipeline strategy
+
+```
+1. Fetch Netflix TSV (single GET)
+2. Filter: latest week only, 18 tracked countries
+3. For each unique (title, category): TMDB /search/{movie|tv} → tmdb_id, release_year
+4. For each tmdb_id: TMDB /credits → cast list
+5. Match: dict.get(tmdb_person_id) against in-memory {tmdb_person_id: artist} index
+6. Score: max-per-title, sum-per-artist
+7. Upsert into general.artist_dp_netflix
+```
+
+Match step is **deterministic** — single hash lookup by `tmdb_person_id`. No name normalization, no fuzzy matching, no ambiguity handling. Coverage depends on how many actors have `tmdb_person_id` populated (see alias backfill below).
+
+## Alias backfill (prerequisite)
+
+The pipeline can only match artists that have `tmdb_person_id` set. The backfill script populates it (and rich aliases) from TMDB.
+
+```bash
+# Test on 10 actors first
+python3 scripts/backfill_aliases_from_tmdb.py --limit 10
 python3 scripts/backfill_aliases_from_tmdb.py --limit 10 --apply
 
 # Run on all Actors
 python3 scripts/backfill_aliases_from_tmdb.py --apply
 
-# Re-process actors that already have tmdb_person_id (e.g. after improving filters)
+# Re-process actors that already have tmdb_person_id
 python3 scripts/backfill_aliases_from_tmdb.py --apply --force
 ```
 
-Flags:
-- `--limit N` — cap artists processed (testing)
-- `--workers N` — concurrency (default 10)
-- `--timeout S` — per-request timeout (default 10s)
-- `--force` — re-process artists with existing `tmdb_person_id`
+Strategy (conservative — skips uncertain matches):
+- Pre-filter to `type: "Actor"` (skips musicians and groups)
+- Search `/search/person`, fetch `/person/{id}` for top-5 candidates
+- Korean-name verification: only accept candidates whose `also_known_as` contains the artist's `korean_name` (NFKC-normalized)
+- Skip if zero or multiple candidates verify
+- Group-name filter: drop aliases that match another artist's primary name (catches "Red Velvet", "소녀시대", etc.)
 
 ### Rollback
 
-Removes everything the backfill wrote — refetches each artist's `also_known_as` from TMDB and `$pullAll` those exact strings, then `$unset` `tmdb_person_id`.
+Removes everything backfill wrote — refetches each artist's `also_known_as` from TMDB, `$pullAll` those exact strings, `$unset` `tmdb_person_id`.
 
 ```bash
-# Dry run
-python3 scripts/rollback_aliases_backfill.py
-
-# Commit
+python3 scripts/rollback_aliases_backfill.py             # dry-run
 python3 scripts/rollback_aliases_backfill.py --apply
 ```
 
-## How it works
-
-The backfill is conservative — it skips uncertain matches rather than guessing.
-
-```
-For each artist with type: "Actor":
-  1. Search TMDB /search/person?query=<english_name or korean_name>
-  2. For top-5 candidates: fetch /person/{id}, check if also_known_as
-     (NFKC-normalized) contains artist's korean_name
-  3. If exactly one candidate verifies -> accept
-     If zero or multiple verify -> skip (logged as 'missing')
-  4. Filter aliases that match other artists' primary names or aliases
-     (drops group names like 'Red Velvet', '소녀시대')
-  5. $addToSet aliases + normalized_aliases, $set tmdb_person_id
-```
-
-**Pre-filter**: only `type: "Actor"` documents are searched. Musicians and groups are skipped — TMDB doesn't have entries for them and naive search produces wrong matches (e.g. K-pop "Wendy" → American actress "Wendy Crawson").
-
-**Korean-name verification** is the load-bearing safeguard. TMDB's mononym search returns up to 20 candidates ranked by global popularity; without verification, the first hit is rarely the right person.
-
-**Group-name filter** rebuilds a blocked-set from the entire `artists` collection (all `english_name`, `korean_name`, and existing `aliases`) on each run. Anything in TMDB's `also_known_as` that matches an entry in this set gets dropped.
-
-## Data shape
-
-After backfill:
-
-```js
-{
-  _id: ObjectId("..."),
-  english_name: "Tiffany Young",
-  korean_name: "티파니",
-  type: ["Musician", "Actor"],
-  // added by backfill:
-  tmdb_person_id: 1471055,
-  aliases: ["Stephanie Young Hwang", "황미영", "黃美永", "ティファニー", "Fany"],
-  normalized_aliases: ["stephanieyounghwang", "황미영", "黃美永", "ティファニー", "fany"],
-}
-```
-
-`aliases` and `normalized_aliases` are kept as flat `string[]` (no per-alias provenance metadata — kept simple).
-
-## Stats from a real run
+## Sample run stats
 
 | Metric | Count |
 |---|---|
-| Actors processed | 1137 |
-| Successfully aliased | 703 (62%) |
-| Skipped (couldn't verify) | 434 (38%) |
-| Average aliases per matched artist | 4.7 |
-| Total runtime | ~60 seconds |
-
-The 434 skipped are typically lesser-known actors not in TMDB, or actors whose TMDB record uses a Korean-name variant that doesn't NFKC-match the stored `korean_name`. Manual curation or relaxed-fallback strategies can close this gap.
+| Tracked Actors | 1137 |
+| Actors with `tmdb_person_id` | 700 (62%) |
+| Netflix entries (latest week) | 360 across 18 countries |
+| Unique titles | 167 |
+| Titles resolved on TMDB | 158 (95%) |
+| Cast → artist matches | 125 |
+| Artists scored | 46 |
+| Pipeline runtime | ~70 seconds |
 
 ## Files
 
 ```
+handler.py                              # pipeline (Lambda + CLI)
 scripts/
-  backfill_aliases_from_tmdb.py   # main backfill script
-  rollback_aliases_backfill.py    # undo a backfill run
-requirements.txt                   # requests + pymongo
-CLAUDE.md                          # context for Claude Code sessions
+  backfill_aliases_from_tmdb.py
+  rollback_aliases_backfill.py
+requirements.txt                        # requests + pymongo
+CLAUDE.md                               # context for Claude Code sessions
 ```
