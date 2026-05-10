@@ -34,3 +34,6 @@ lambda.zip
 # OS
 .DS_Store
 Thumbs.db
+
+# Script output
+out/
